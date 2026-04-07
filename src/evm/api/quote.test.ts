@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { getQuote, type QuoteRequest } from './quote.js'
+import { QuoteAmountSide } from './types.js'
 
 const baseQuoteRequest = {
   chainId: 1,
@@ -31,6 +32,29 @@ describe('getQuote', () => {
       ])
     }
   })
+
+  it(
+    'should resolve amountSide "to" to a quote that delivers at least the target out',
+    async () => {
+      const ref = await getQuote(baseQuoteRequest)
+      expect(['Success', 'Partial']).toContain(ref.status)
+      if (ref.status === 'NoWay') {
+        return
+      }
+      const targetOut = BigInt(ref.assumedAmountOut)
+      const result = await getQuote({
+        ...baseQuoteRequest,
+        amount: targetOut,
+        amountSide: QuoteAmountSide.To,
+      })
+      expect(['Success', 'Partial']).toContain(result.status)
+      if (result.status !== 'NoWay') {
+        expect(BigInt(result.assumedAmountOut)).toBeGreaterThanOrEqual(targetOut)
+        expect(BigInt(result.amountIn)).toBeGreaterThan(0n)
+      }
+    },
+    60_000,
+  )
 
   it.skip('should return a quote when url is set to staging', async () => {
     const result = await getQuote({

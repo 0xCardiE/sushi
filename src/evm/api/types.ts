@@ -13,3 +13,9 @@ export enum RouterLiquiditySource {
   Sender = 'sender', // msg.sender
   Self = 'self',
 }
+
+/** Whether `amount` on quote/swap requests is spent (token in) or desired received (token out). */
+export enum QuoteAmountSide {
+  From = 'from',
+  To = 'to',
+}

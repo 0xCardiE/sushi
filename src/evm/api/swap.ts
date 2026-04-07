@@ -5,6 +5,12 @@ import { version } from '../../version.js'
 import type { SwapApiSupportedChainId } from '../config/index.js'
 import { szevm } from '../validate/zod.js'
 import {
+  getQuote,
+  type QuoteRequest,
+  quoteRequestSharedFields,
+} from './quote.js'
+import {
+  QuoteAmountSide,
   type RouterLiquiditySource,
   RouteStatus,
   type TransferValue,
@@ -28,6 +34,11 @@ export type SwapRequest<Simulate extends boolean = true> = {
   simulate?: Simulate
   validate?: boolean
   apiKey?: string
+  /**
+   * `from` (default): `amount` is token-in amount.
+   * `to`: `amount` is desired token-out; resolved via `getQuote` before building the swap request.
+   */
+  amountSide?: QuoteAmountSide
 }
 
 function swapResponseSchema<Simulate extends boolean>(simulate?: Simulate) {
@@ -94,6 +105,22 @@ export async function getSwap<Simulate extends boolean = true>(
   options?: RequestInit,
 ): Promise<SwapResponse<Simulate>> {
   // TODO: VALIDATE PARAMS
+  let amountIn = params.amount
+  if (params.amountSide === QuoteAmountSide.To) {
+    const quoted = await getQuote(
+      {
+        ...quoteRequestSharedFields(params),
+        amount: params.amount,
+        amountSide: QuoteAmountSide.To,
+      } as QuoteRequest<false>,
+      options,
+    )
+    if (quoted.status === RouteStatus.NoWay) {
+      return { status: RouteStatus.NoWay } as SwapResponse<Simulate>
+    }
+    amountIn = BigInt(quoted.amountIn)
+  }
+
   const url = new URL(
     `swap/v7/${params.chainId}`,
     params.baseUrl ?? 'https://api.sushi.com',
@@ -102,7 +129,7 @@ export async function getSwap<Simulate extends boolean = true>(
   url.searchParams.append('tokenIn', params.tokenIn)
   url.searchParams.append('tokenOut', params.tokenOut)
   url.searchParams.append('sender', params.sender)
-  url.searchParams.append('amount', params.amount.toString())
+  url.searchParams.append('amount', amountIn.toString())
   url.searchParams.append('maxSlippage', params.maxSlippage.toString())
 
   if (params.source) {

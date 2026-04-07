@@ -3,7 +3,7 @@ import * as z from 'zod'
 import { version } from '../../version.js'
 import type { SwapApiSupportedChainId } from '../config/index.js'
 import { szevm } from '../validate/zod.js'
-import { RouteStatus, type TransferValue } from './types.js'
+import { QuoteAmountSide, RouteStatus, type TransferValue } from './types.js'
 
 export type QuoteRequest<Vizualize extends boolean = false> = {
   chainId: SwapApiSupportedChainId
@@ -18,6 +18,11 @@ export type QuoteRequest<Vizualize extends boolean = false> = {
   referrer?: string
   visualize?: Vizualize
   baseUrl?: string
+  /**
+   * `from` (default): `amount` is the exact token-in amount (current API behaviour).
+   * `to`: `amount` is the desired token-out amount; the SDK resolves the required token-in amount via iterative quotes (slower, multiple HTTP calls).
+   */
+  amountSide?: QuoteAmountSide
 }
 
 function quoteResponseSchema<Visualize extends boolean>(visualize?: Visualize) {
@@ -85,11 +90,45 @@ export type QuoteResponse<Visualize extends boolean = false> = z.infer<
   ReturnType<typeof quoteResponseSchema<Visualize>>
 >
 
-export async function getQuote<Visualize extends boolean = false>(
+/** Shared optional fields for `getQuote` / exact-out resolution (`exactOptionalPropertyTypes`-safe). */
+export function quoteRequestSharedFields(
+  params: Pick<
+    QuoteRequest,
+    | 'chainId'
+    | 'tokenIn'
+    | 'tokenOut'
+    | 'maxSlippage'
+    | 'maxPriceImpact'
+    | 'fee'
+    | 'feeReceiver'
+    | 'feeBy'
+    | 'referrer'
+    | 'baseUrl'
+  >,
+) {
+  return {
+    chainId: params.chainId,
+    tokenIn: params.tokenIn,
+    tokenOut: params.tokenOut,
+    maxSlippage: params.maxSlippage,
+    ...(params.maxPriceImpact !== undefined
+      ? { maxPriceImpact: params.maxPriceImpact }
+      : {}),
+    ...(typeof params.fee === 'bigint' &&
+    params.fee > 0n &&
+    params.feeReceiver !== undefined
+      ? { fee: params.fee, feeReceiver: params.feeReceiver }
+      : {}),
+    ...(params.feeBy !== undefined ? { feeBy: params.feeBy } : {}),
+    ...(params.referrer !== undefined ? { referrer: params.referrer } : {}),
+    ...(params.baseUrl !== undefined ? { baseUrl: params.baseUrl } : {}),
+  }
+}
+
+async function requestQuote<Visualize extends boolean>(
   params: QuoteRequest<Visualize>,
   options?: RequestInit,
 ): Promise<QuoteResponse<Visualize>> {
-  // TODO: VALIDATE PARAMS
   const url = new URL(
     `quote/v7/${params.chainId}`,
     params.baseUrl ?? 'https://api.sushi.com',
@@ -135,4 +174,86 @@ export async function getQuote<Visualize extends boolean = false>(
   return quoteResponseSchema(params.visualize).parse(
     await res.json(),
   ) as QuoteResponse<Visualize>
+}
+
+const MAX_EXACT_OUT_INPUT = 2n ** 200n
+const MAX_EXACT_OUT_BRACKET_STEPS = 96
+
+function quoteAssumedOut(response: QuoteResponse<boolean>): bigint | undefined {
+  if (response.status === RouteStatus.NoWay) {
+    return undefined
+  }
+  return BigInt(response.assumedAmountOut)
+}
+
+async function quoteExactOut<Visualize extends boolean>(
+  params: QuoteRequest<Visualize>,
+  options?: RequestInit,
+): Promise<QuoteResponse<Visualize>> {
+  const targetOut = params.amount
+  if (targetOut <= 0n) {
+    throw new Error('amount must be positive when amountSide is "to"')
+  }
+
+  const searchBase = quoteRequestSharedFields(params)
+
+  let high = 1n
+  let foundUpper = false
+  for (let step = 0; step < MAX_EXACT_OUT_BRACKET_STEPS; step++) {
+    if (high > MAX_EXACT_OUT_INPUT) {
+      break
+    }
+    const res = await requestQuote(
+      { ...searchBase, amount: high } as QuoteRequest<false>,
+      options,
+    )
+    const out = quoteAssumedOut(res)
+    if (out !== undefined && out >= targetOut) {
+      foundUpper = true
+      break
+    }
+    high *= 2n
+  }
+
+  if (!foundUpper) {
+    throw new Error(
+      'Could not satisfy exact-out quote: increase liquidity or lower target amount',
+    )
+  }
+
+  let lo = 1n
+  let hi = high
+  while (lo < hi) {
+    const mid = (lo + hi) / 2n
+    const res = await requestQuote(
+      { ...searchBase, amount: mid } as QuoteRequest<false>,
+      options,
+    )
+    const out = quoteAssumedOut(res)
+    if (out === undefined || out < targetOut) {
+      lo = mid + 1n
+    } else {
+      hi = mid
+    }
+  }
+
+  return requestQuote(
+    {
+      ...quoteRequestSharedFields(params),
+      amount: lo,
+      ...(params.visualize === true ? { visualize: true } : {}),
+    } as QuoteRequest<Visualize>,
+    options,
+  )
+}
+
+export async function getQuote<Visualize extends boolean = false>(
+  params: QuoteRequest<Visualize>,
+  options?: RequestInit,
+): Promise<QuoteResponse<Visualize>> {
+  // TODO: VALIDATE PARAMS
+  if (params.amountSide === QuoteAmountSide.To) {
+    return quoteExactOut(params, options)
+  }
+  return requestQuote(params, options)
 }
